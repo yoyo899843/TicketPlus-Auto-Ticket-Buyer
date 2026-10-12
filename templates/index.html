@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ticket Bot</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  input { padding: .5rem; font-size: 1rem; }
+  input[type=text] { width: 100%; box-sizing: border-box; margin-bottom: .5rem; }
+  button { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+  td, th { text-align: left; padding: .3rem .4rem; border-bottom: 1px solid #eee; }
+  .muted { color: #777; font-size: .9rem; }
+  .ok { color: #1a7f37; } .bad { color: #b42318; }
+</style>
+</head>
+<body>
+<h1>Ticket Plus 搶票</h1>
+
+<section>
+  <strong>1. 開啟票區總覽</strong>
+  <p class="muted">貼上票區一覽頁的網址，並在跳出的瀏覽器登入。<span id="login"></span></p>
+  <input type="text" id="url" placeholder="https://ticketplus.com.tw/order/...">
+  <button id="open">開啟瀏覽器</button>
+
+  <p class="muted" style="margin-top:1rem">
+    若活動尚未開賣，可在此設定要購買的場次日期，系統會持續重新整理「立即購買」區塊（id=buyTicket），
+    出現按鈕後自動點擊該日期旁邊的按鈕（留空則點第一個出現的按鈕），
+    接著自動偵測票區價格並開始搶票，中間不需手動點擊第 2、3 步。
+  </p>
+  <label>場次日期 <input type="date" id="buyDate" style="width:10rem"></label>
+  <label>價格 <input type="number" id="price" placeholder="留空＝隨機" style="width:8rem"></label>
+  <label>張數 <input type="number" id="qty" value="1" min="1" max="8" style="width:5rem"></label>
+  <button id="waitBuy">一次跑完全部步驟</button>
+  <button id="stopWaitBuy">停止</button>
+  <p id="buyMsg" class="muted"></p>
+</section>
+
+<section>
+  <strong>2. 偵測到的票區與價格</strong>
+  <button id="detect" style="float:right">重新偵測</button>
+  <table><thead><tr><th>票區</th><th>價格</th><th>剩餘</th></tr></thead><tbody id="areas"></tbody></table>
+  <p class="muted" id="areas-empty">尚未偵測</p>
+</section>
+
+<section>
+  <strong>3. 開始搶票</strong>
+  <p class="muted">會自動偵測價格，隨機挑一個有票的價格購買，沒票時持續重試。若已用步驟 1 的「一次跑完全部步驟」會自動啟動，這裡只用於手動單獨啟動（沿用上方的價格／張數設定）。</p>
+  <button id="start">開始搶票</button>
+  <button id="stop">停止</button>
+  <p id="msg"></p>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function renderAreas(areas) {
+  $('areas').innerHTML = areas.map(a =>
+    `<tr style="cursor:pointer" onclick="$('price').value=${a.price ?? ''}"><td>${a.name}</td><td>${a.price == null ? '-' : 'NT.' + a.price.toLocaleString()}</td>` +
+    `<td>${a.remaining == null ? '-' : a.remaining}</td></tr>`).join('');
+  $('areas-empty').style.display = areas.length ? 'none' : '';
+  $('areas-empty').textContent = '沒有偵測到票區';
+}
+
+function showError(e) { $('msg').innerHTML = `<span class="bad">${e.message}</span>`; }
+
+$('open').onclick = async () => {
+  $('msg').textContent = '開啟中...';
+  try { await api('/api/open-url', {url: $('url').value.trim()}); $('waitBuy').click(); }
+  catch (e) { showError(e); }
+};
+$('detect').onclick = async () => {
+  try { renderAreas((await api('/api/prices')).areas); } catch (e) { showError(e); }
+};
+$('waitBuy').onclick = async () => {
+  $('buyMsg').textContent = '啟動中...';
+  try {
+    await api('/api/wait-buy', {
+      date: $('buyDate').value,
+      price: $('price').value,
+      quantity: parseInt($('qty').value) || 1,
+    });
+  } catch (e) { $('buyMsg').innerHTML = `<span class="bad">${e.message}</span>`; }
+};
+$('stopWaitBuy').onclick = () => Promise.all([
+  api('/api/stop-wait-buy', {}).catch(() => {}),
+  api('/api/stop', {}).catch(() => {}),
+]);
+$('start').onclick = async () => {
+  try { await api('/api/start', {quantity: parseInt($('qty').value) || 1, price: $('price').value}); } catch (e) { showError(e); }
+};
+$('stop').onclick = () => api('/api/stop', {}).catch(showError);
+
+async function poll() {
+  try {
+    const s = await api('/api/status');
+    $('login').innerHTML = s.logged_in ? '<span class="ok">已登入</span>' : '<span class="bad">尚未登入</span>';
+    $('start').disabled = s.running;
+    $('stop').disabled = !s.running;
+    if (s.message) $('msg').textContent = s.message;
+    if (s.running) renderAreas(s.areas);
+    $('waitBuy').disabled = s.buy_running || s.running;
+    $('stopWaitBuy').disabled = !s.buy_running && !s.running;
+    if (s.buy_message) $('buyMsg').textContent = s.buy_message;
+  } catch (e) {}
+}
+setInterval(poll, 1500);
+poll();
+</script>
+</body>
+</html>
