@@ -91,6 +91,15 @@ class TicketBot:
         self._buy_message = ""
         self._buy_sessions = []
 
+        # 指定／排除價格：執行中也可即時更新（見 set_price_filters）
+        self._price = None
+        self._exclude_price = None
+
+    def set_price_filters(self, price=None, exclude_price=None):
+        """更新指定／排除價格，背景搶票迴圈會在下一次嘗試時套用新設定。"""
+        self._price = price
+        self._exclude_price = exclude_price
+
     # ── 瀏覽器 ──────────────────────────────────
 
     def _alive(self) -> bool:
@@ -195,7 +204,7 @@ class TicketBot:
         """點了「立即購買」後等待跳轉到選位頁（.seats-area 出現）。"""
         self._wait_for_areas()
 
-    def _buy_loop(self, target_date, quantity: int, price):
+    def _buy_loop(self, target_date, quantity: int):
         first = True
         try:
             while not self._buy_stop_event.is_set():
@@ -205,7 +214,7 @@ class TicketBot:
                     if self._click_buy_session(target_date):
                         self._wait_after_buy_click()
                         self._buy_message += "，自動進入搶票流程…"
-                        self.start_grab(quantity, price)
+                        self.start_grab(quantity, self._price, self._exclude_price)
                         break
                     self._buy_message = "#buyTicket 尚無可購買按鈕，重新整理中…" + (
                         f"（等待日期 {target_date}）" if target_date else "")
@@ -218,17 +227,19 @@ class TicketBot:
         finally:
             self._buy_running = False
 
-    def start_wait_buy(self, target_date: str = None, quantity: int = 1, price=None):
+    def start_wait_buy(self, target_date: str = None, quantity: int = 1, price=None, exclude_price=None):
         """背景重複偵測 #buyTicket 按鈕，出現後點擊符合日期的場次，
         成功後自動接著偵測價格並開始搶票，不需手動點擊後續步驟。"""
         if self._buy_running:
             raise RuntimeError("已在偵測中")
         if not self._page:
             raise RuntimeError("請先開啟票區總覽網址")
+        self._price = price
+        self._exclude_price = exclude_price
         self._buy_stop_event.clear()
         self._buy_running = True
         self._buy_message = "開始偵測立即購買按鈕…"
-        threading.Thread(target=self._buy_loop, args=(target_date, quantity, price), daemon=True).start()
+        threading.Thread(target=self._buy_loop, args=(target_date, quantity), daemon=True).start()
 
     def stop_wait_buy(self):
         self._buy_stop_event.set()
@@ -268,18 +279,20 @@ class TicketBot:
 
     # ── 搶票 ────────────────────────────────────
 
-    def _pick_area(self, areas, quantity, price=None):
-        """price 指定時只搶該價格；否則在偵測到的價格中隨機挑一個，再從該價格的有票票區隨機挑一個。"""
+    def _pick_area(self, areas, quantity, price=None, exclude_price=None):
+        """price 指定時只搶該價格列表中的其中一個；exclude_price 指定時排除這些價格；
+        否則在偵測到的價格中隨機挑一個，再從該價格的有票票區隨機挑一個。"""
         ok = [a for a in areas if self._is_available(a)
               and (a["remaining"] is None or a["remaining"] >= quantity)
-              and (price is None or a["price"] == price)]
+              and (not price or a["price"] in price)
+              and (not exclude_price or a["price"] not in exclude_price)]
         if not ok:
             return None
-        price = random.choice(sorted({a["price"] for a in ok}))
-        return random.choice([a for a in ok if a["price"] == price])
+        chosen_price = random.choice(sorted({a["price"] for a in ok}))
+        return random.choice([a for a in ok if a["price"] == chosen_price])
 
     @on_worker
-    def _attempt(self, quantity: int, first: bool, price=None) -> bool:
+    def _attempt(self, quantity: int, first: bool, price=None, exclude_price=None) -> bool:
         """做一次嘗試：重新整理 → 偵測 → 隨機選價 → 加票 → 下一步。成功回傳 True。"""
         page = self._page
         if not first:
@@ -293,9 +306,14 @@ class TicketBot:
         if not areas:
             self._message = "找不到票區，等待頁面載入…"
             return False
-        area = self._pick_area(areas, quantity, price)
+        area = self._pick_area(areas, quantity, price, exclude_price)
         if not area:
-            self._message = "目前沒有可購買的" + (f" NT.{price:,} " if price else "") + "票區，持續重試中…"
+            cond = ""
+            if price:
+                cond += " 指定 " + "/".join(f"NT.{p:,}" for p in price)
+            if exclude_price:
+                cond += " 排除 " + "/".join(f"NT.{p:,}" for p in exclude_price)
+            self._message = f"目前沒有可購買的{cond} 票區，持續重試中…"
             return False
 
         self._message = f"嘗試 {area['name']} NT.{area['price']:,} × {quantity}"
@@ -327,12 +345,14 @@ class TicketBot:
         self._message = f"已選 {area['name']} NT.{area['price']:,} × {quantity}，請在瀏覽器完成後續步驟"
         return True
 
-    def _grab_loop(self, quantity: int, price=None):
+    def _grab_loop(self, quantity: int):
         first = True
         try:
             while not self._stop_event.is_set():
                 try:
-                    if self._attempt(quantity, first, price):
+                    # 每次嘗試都重新讀取 self._price / self._exclude_price，
+                    # 讓前端中途更新的指定／排除價格能立刻套用，不必重新啟動。
+                    if self._attempt(quantity, first, self._price, self._exclude_price):
                         break
                 except Exception as e:
                     self._message = f"嘗試失敗：{e}"
@@ -343,16 +363,18 @@ class TicketBot:
         finally:
             self._running = False
 
-    def start_grab(self, quantity: int = 1, price=None):
+    def start_grab(self, quantity: int = 1, price=None, exclude_price=None):
         """背景重複嘗試，直到成功或被停止。"""
         if self._running:
             raise RuntimeError("已在搶票中")
         if not self._page:
             raise RuntimeError("請先開啟票區總覽網址")
+        self._price = price
+        self._exclude_price = exclude_price
         self._stop_event.clear()
         self._running = True
         self._message = "開始搶票…"
-        threading.Thread(target=self._grab_loop, args=(quantity, price), daemon=True).start()
+        threading.Thread(target=self._grab_loop, args=(quantity,), daemon=True).start()
 
     def stop_grab(self):
         self._stop_event.set()

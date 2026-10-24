@@ -6,6 +6,16 @@ app = Flask(__name__)
 bot = TicketBot()
 
 
+def _parse_prices(value):
+    """接受單一值或陣列，回傳整數價格列表（無值則回傳 None）。"""
+    if value in (None, "", []):
+        return None
+    if not isinstance(value, list):
+        value = [value]
+    prices = [int(str(v).replace(",", "")) for v in value if str(v).strip() != ""]
+    return prices or None
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -47,10 +57,10 @@ def wait_buy():
     data = request.json or {}
     date = (data.get("date") or "").strip() or None
     try:
-        price = data.get("price")
-        price = int(str(price).replace(",", "")) if price not in (None, "") else None
+        price = _parse_prices(data.get("price"))
+        exclude_price = _parse_prices(data.get("excludePrice"))
         quantity = int(data.get("quantity", 1))
-        bot.start_wait_buy(date, quantity=quantity, price=price)
+        bot.start_wait_buy(date, quantity=quantity, price=price, exclude_price=exclude_price)
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -72,15 +82,29 @@ def get_prices():
         return jsonify({"error": str(e)}), 500
 
 
+# ── 即時更新指定／排除價格（執行中也會立即套用）──
+
+@app.route("/api/set-prices", methods=["POST"])
+def set_prices():
+    data = request.json or {}
+    try:
+        price = _parse_prices(data.get("price"))
+        exclude_price = _parse_prices(data.get("excludePrice"))
+        bot.set_price_filters(price, exclude_price)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ── 開始 / 停止搶票（自動偵測價格並隨機選一個）──
 
 @app.route("/api/start", methods=["POST"])
 def start_ticket():
     data = request.json or {}
     try:
-        price = data.get("price")
-        price = int(str(price).replace(",", "")) if price not in (None, "") else None
-        bot.start_grab(int(data.get("quantity", 1)), price)
+        price = _parse_prices(data.get("price"))
+        exclude_price = _parse_prices(data.get("excludePrice"))
+        bot.start_grab(int(data.get("quantity", 1)), price, exclude_price)
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

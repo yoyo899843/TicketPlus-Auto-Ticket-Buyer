@@ -15,6 +15,14 @@
   td, th { text-align: left; padding: .3rem .4rem; border-bottom: 1px solid #eee; }
   .muted { color: #777; font-size: .9rem; }
   .ok { color: #1a7f37; } .bad { color: #b42318; }
+  .price-block { margin: .6rem 0; }
+  .price-block > label { font-weight: 600; display: block; margin-bottom: .3rem; }
+  .price-tags { display: flex; flex-wrap: wrap; gap: .4rem; min-height: 1.6rem; margin-bottom: .4rem; }
+  .tag { background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 999px; padding: .2rem .6rem; font-size: .85rem; display: inline-flex; align-items: center; gap: .3rem; }
+  .tag.exclude { background: #fef2f2; border-color: #fecaca; }
+  .tag button { border: none; background: none; cursor: pointer; font-size: .9rem; line-height: 1; padding: 0; color: #555; }
+  .price-add { display: flex; gap: .5rem; align-items: center; }
+  .price-add input { width: 8rem; margin-bottom: 0; }
 </style>
 </head>
 <body>
@@ -32,8 +40,25 @@
     接著自動偵測票區價格並開始搶票，中間不需手動點擊第 2、3 步。
   </p>
   <label>場次日期 <input type="date" id="buyDate" style="width:10rem"></label>
-  <label>價格 <input type="number" id="price" placeholder="留空＝隨機" style="width:8rem"></label>
   <label>張數 <input type="number" id="qty" value="1" min="1" max="8" style="width:5rem"></label>
+
+  <div class="price-block">
+    <label>指定價格（可新增多個，留空＝不限）</label>
+    <div class="price-tags" id="priceTags"></div>
+    <div class="price-add">
+      <input type="number" id="priceInput" placeholder="輸入價格">
+      <button type="button" id="addPrice">新增價格</button>
+    </div>
+  </div>
+
+  <div class="price-block">
+    <label>排除價格（可新增多個）</label>
+    <div class="price-tags" id="excludePriceTags"></div>
+    <div class="price-add">
+      <input type="number" id="excludePriceInput" placeholder="輸入價格">
+      <button type="button" id="addExcludePrice">新增價格</button>
+    </div>
+  </div>
   <button id="waitBuy">一次跑完全部步驟</button>
   <button id="stopWaitBuy">停止</button>
   <p id="buyMsg" class="muted"></p>
@@ -66,10 +91,53 @@ async function api(path, body) {
   return data;
 }
 
+let includePrices = [];
+let excludePrices = [];
+
+function renderTags(containerId, arr, cls, onRemove) {
+  const el = $(containerId);
+  el.innerHTML = arr.length
+    ? arr.map((p, i) => `<span class="tag ${cls}">NT.${Number(p).toLocaleString()}<button type="button" data-i="${i}">×</button></span>`).join('')
+    : '<span class="muted">未設定</span>';
+  el.querySelectorAll('button').forEach(btn => btn.onclick = () => onRemove(parseInt(btn.dataset.i)));
+}
+
+function syncPrices() {
+  // 即時同步到後端：就算搶票流程已經在跑，也會立刻套用新的指定／排除價格。
+  api('/api/set-prices', {price: includePrices, excludePrice: excludePrices}).catch(() => {});
+}
+
+function renderIncludeTags() {
+  renderTags('priceTags', includePrices, '', i => { includePrices.splice(i, 1); renderIncludeTags(); });
+  syncPrices();
+}
+function renderExcludeTags() {
+  renderTags('excludePriceTags', excludePrices, 'exclude', i => { excludePrices.splice(i, 1); renderExcludeTags(); });
+  syncPrices();
+}
+
+function addPriceTo(arr, value, render) {
+  const v = parseInt(String(value).replace(/,/g, ''));
+  if (!Number.isFinite(v)) return;
+  if (!arr.includes(v)) arr.push(v);
+  render();
+}
+
+$('addPrice').onclick = () => { addPriceTo(includePrices, $('priceInput').value, renderIncludeTags); $('priceInput').value = ''; };
+$('addExcludePrice').onclick = () => { addPriceTo(excludePrices, $('excludePriceInput').value, renderExcludeTags); $('excludePriceInput').value = ''; };
+$('priceInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('addPrice').click(); } });
+$('excludePriceInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('addExcludePrice').click(); } });
+
 function renderAreas(areas) {
-  $('areas').innerHTML = areas.map(a =>
-    `<tr style="cursor:pointer" onclick="$('price').value=${a.price ?? ''}"><td>${a.name}</td><td>${a.price == null ? '-' : 'NT.' + a.price.toLocaleString()}</td>` +
+  $('areas').innerHTML = areas.map((a, i) =>
+    `<tr style="cursor:pointer" data-price="${a.price ?? ''}" title="點擊加入指定價格"><td>${a.name}</td><td>${a.price == null ? '-' : 'NT.' + a.price.toLocaleString()}</td>` +
     `<td>${a.remaining == null ? '-' : a.remaining}</td></tr>`).join('');
+  $('areas').querySelectorAll('tr').forEach(tr => {
+    tr.onclick = () => {
+      const p = tr.dataset.price;
+      if (p !== '') addPriceTo(includePrices, p, renderIncludeTags);
+    };
+  });
   $('areas-empty').style.display = areas.length ? 'none' : '';
   $('areas-empty').textContent = '沒有偵測到票區';
 }
@@ -89,7 +157,8 @@ $('waitBuy').onclick = async () => {
   try {
     await api('/api/wait-buy', {
       date: $('buyDate').value,
-      price: $('price').value,
+      price: includePrices,
+      excludePrice: excludePrices,
       quantity: parseInt($('qty').value) || 1,
     });
   } catch (e) { $('buyMsg').innerHTML = `<span class="bad">${e.message}</span>`; }
@@ -99,7 +168,7 @@ $('stopWaitBuy').onclick = () => Promise.all([
   api('/api/stop', {}).catch(() => {}),
 ]);
 $('start').onclick = async () => {
-  try { await api('/api/start', {quantity: parseInt($('qty').value) || 1, price: $('price').value}); } catch (e) { showError(e); }
+  try { await api('/api/start', {quantity: parseInt($('qty').value) || 1, price: includePrices, excludePrice: excludePrices}); } catch (e) { showError(e); }
 };
 $('stop').onclick = () => api('/api/stop', {}).catch(showError);
 
@@ -116,6 +185,8 @@ async function poll() {
     if (s.buy_message) $('buyMsg').textContent = s.buy_message;
   } catch (e) {}
 }
+renderIncludeTags();
+renderExcludeTags();
 setInterval(poll, 1500);
 poll();
 </script>
