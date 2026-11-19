@@ -2,3 +2,4 @@ __pycache__
 .vscode
 browser_profile
 cookie.json
+.venv
