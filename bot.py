@@ -58,13 +58,13 @@ _READ_AREAS_JS = """() => {
         const h = p.querySelector(':scope > button.v-expansion-panel-header');
         const t = h.innerText.replace(/\\s+/g, ' ').trim();
         const pm = t.match(/NT\\.?\\s*([\\d,]+)/);
-        const rm = t.match(/剩餘\\s*(\\d+)/);
+        const rm = t.match(/剩餘[\\s:：]*([\\d,]+)/);
         return {
             index: i,
             group: groups.findIndex(g => g.contains(p)),
-            name: t.replace(/剩餘\\s*\\d+/, '').replace(/NT\\.?\\s*[\\d,]+/, '').trim(),
+            name: t.replace(/剩餘[\\s:：]*[\\d,]+/, '').replace(/NT\\.?\\s*[\\d,]+/, '').trim(),
             price: pm ? parseInt(pm[1].replace(/,/g, '')) : null,
-            remaining: rm ? parseInt(rm[1]) : null,
+            remaining: rm ? parseInt(rm[1].replace(/,/g, '')) : null,
             disabled: h.disabled || p.classList.contains('v-expansion-panel--disabled'),
             active: p.classList.contains('v-expansion-panel--active'),
         };
@@ -112,26 +112,44 @@ class TicketBot:
     @on_worker
     def start(self):
         if self._context and not self._alive():
-            self.stop()
+            # 使用者關掉視窗：只重開瀏覽器，保留同一個 Playwright 實例
+            self.stop_grab()
+            self._close_context()
         if self._context:
             return
-        self._pw = sync_playwright().start()
-        self._context = self._pw.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=False, locale="zh-TW", args=["--lang=zh-TW"])
+        # 同一條執行緒只能有一個 sync_playwright 實例，第二次 start() 會丟出
+        # 「using Playwright Sync API inside the asyncio loop」，所以一律重用
+        if not self._pw:
+            self._pw = sync_playwright().start()
+        try:
+            self._context = self._pw.chromium.launch_persistent_context(
+                str(PROFILE_DIR), headless=False, locale="zh-TW", args=["--lang=zh-TW"])
+        except Exception as e:
+            if "Executable doesn't exist" in str(e):
+                raise RuntimeError(
+                    "找不到 Playwright 瀏覽器，請先在終端機執行：python3 -m playwright install chromium") from e
+            raise
         self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
         self._page.set_default_timeout(5_000)  # 避免單一動作卡 30 秒擋住其他請求
+
+    def _close_context(self):
+        if self._context:
+            try:
+                self._context.close()
+            except Exception:
+                pass
+        self._page = self._context = None
 
     @on_worker
     def stop(self):
         self.stop_grab()
-        for attr in ("_context", "_pw"):
-            obj = getattr(self, attr)
-            if obj:
-                try:
-                    obj.close() if attr == "_context" else obj.stop()
-                except Exception:
-                    pass
-        self._page = self._context = self._pw = None
+        self._close_context()
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+        self._pw = None
 
     @on_worker
     def open_url(self, url: str):
@@ -272,18 +290,18 @@ class TicketBot:
         return self._areas
 
     @staticmethod
-    def _is_available(area: dict) -> bool:
+    def _is_available(area: dict, quantity: int = 1) -> bool:
+        """有寫剩餘票數時必須 ≥ 張數才能買；沒寫剩餘票數的票區一律可以直接買。"""
         if area["disabled"] or area["price"] is None:
             return False
-        return area["remaining"] is None or area["remaining"] > 0
+        return area["remaining"] is None or area["remaining"] >= quantity
 
     # ── 搶票 ────────────────────────────────────
 
     def _pick_area(self, areas, quantity, price=None, exclude_price=None):
         """price 指定時只搶該價格列表中的其中一個；exclude_price 指定時排除這些價格；
         否則在偵測到的價格中隨機挑一個，再從該價格的有票票區隨機挑一個。"""
-        ok = [a for a in areas if self._is_available(a)
-              and (a["remaining"] is None or a["remaining"] >= quantity)
+        ok = [a for a in areas if self._is_available(a, quantity)
               and (not price or a["price"] in price)
               and (not exclude_price or a["price"] not in exclude_price)]
         if not ok:

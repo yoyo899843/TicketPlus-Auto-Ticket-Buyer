@@ -23,8 +23,8 @@ MacOS: [下載連結](https://www.python.org/ftp/python/3.14.3/python-3.14.3-mac
 
 接下來輸入指令：
 ```
-python3 -m pip install -r requirementS.txt 
-playwrite install
+python3 -m pip install -r requirements.txt
+python3 -m playwright install chromium
 ```
 
 ### 開始使用
